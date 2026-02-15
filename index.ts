@@ -1,7 +1,9 @@
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-const SOURCE_URL = "https://location.am-all.net/alm/location?gm=98&lang=en&ct=1009";
+const LOCATION_BASE_URL = "https://location.am-all.net/alm/location";
+const LOCATION_GM = "98";
+const LOCATION_LANG = "en";
 const STATE_FILE = process.env.STATE_FILE ?? "state/closest-cabinet.json";
 const RAW_INTERVAL_MINUTES = Number.parseInt(process.env.CHECK_INTERVAL_MINUTES ?? "60", 10);
 const CHECK_INTERVAL_MINUTES = Number.isFinite(RAW_INTERVAL_MINUTES) && RAW_INTERVAL_MINUTES > 0
@@ -19,8 +21,7 @@ type CabinetLocation = {
   id: string;
   name: string;
   address: string;
-  lat: number;
-  lon: number;
+  distanceKm: number;
   detailsUrl: string;
   sourceUrl: string;
   distanceMiles: number;
@@ -31,80 +32,36 @@ type ClosestState = {
   closest: CabinetLocation;
 };
 
-type ChangeEventPayload = {
-  event: "closest_cabinet_changed";
-  checkedAt: string;
-  city: string;
-  previousClosest: CabinetLocation;
-  newClosest: CabinetLocation;
-  sourceUrl: string;
-};
-
 type TargetLocation = {
   lat: number;
   lon: number;
   label: string;
 };
 
-function toRadians(value: number): number {
-  return (value * Math.PI) / 180;
-}
-
-function haversineMiles(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const earthRadiusMiles = 3958.8;
-  const dLat = toRadians(lat2 - lat1);
-  const dLon = toRadians(lon2 - lon1);
-
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRadians(lat1)) * Math.cos(toRadians(lat2)) * Math.sin(dLon / 2) ** 2;
-
-  return earthRadiusMiles * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
 function htmlDecode(value: string): string {
   return value
     .replaceAll("&amp;", "&")
     .replaceAll("&quot;", '"')
     .replaceAll("&#39;", "'")
+    .replaceAll("&#160;", " ")
+    .replaceAll("&nbsp;", " ")
     .replaceAll("&lt;", "<")
     .replaceAll("&gt;", ">")
     .trim();
 }
 
-function extractFirst(source: string, regex: RegExp): string | null {
-  const match = source.match(regex);
-  const value = match?.[1];
-  return value ? htmlDecode(value) : null;
-}
-
-function parseCoordinates(onclick: string): { lat: number; lon: number } | null {
-  const match = onclick.match(/@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)(?:&|')/);
-  const latRaw = match?.[1];
-  const lonRaw = match?.[2];
-
-  if (!latRaw || !lonRaw) {
+function parseDistanceKm(value: string): number | null {
+  const match = value.match(/(\d+(?:\.\d+)?)\s*km/i);
+  const kmRaw = match?.[1];
+  if (!kmRaw) {
     return null;
   }
-
-  const lat = Number.parseFloat(latRaw);
-  const lon = Number.parseFloat(lonRaw);
-
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-    return null;
-  }
-
-  return { lat, lon };
+  const distanceKm = Number.parseFloat(kmRaw);
+  return Number.isFinite(distanceKm) ? distanceKm : null;
 }
 
-function parseCabinetId(onclick: string): string | null {
-  const sidMatch = onclick.match(/sid=(\d+)/);
-  const sid = sidMatch?.[1];
-  return sid ?? null;
-}
-
-async function scrapeLocations(): Promise<CabinetLocation[]> {
-  const response = await fetch(SOURCE_URL);
+async function scrapeLocations(sourceUrl: string): Promise<CabinetLocation[]> {
+  const response = await fetch(sourceUrl);
   if (!response.ok) {
     throw new Error(`Failed to fetch source page: HTTP ${response.status}`);
   }
@@ -115,33 +72,35 @@ async function scrapeLocations(): Promise<CabinetLocation[]> {
   const locations: CabinetLocation[] = [];
 
   for (const li of liBlocks) {
-    const name = extractFirst(li, /class="store_name">([\s\S]*?)<\/span>/);
-    const address = extractFirst(li, /class="store_address">([\s\S]*?)<\/span>/);
-    const mapOnclick = extractFirst(li, /class="store_bt_google_map_en"[^>]*onclick="([^"]+)"/);
-    const detailsOnclick = extractFirst(li, /class="bt_details_en"[^>]*onclick="([^"]+)"/);
+    const nameMatch = li.match(/class="store_name">([\s\S]*?)<\/span>/);
+    const name = nameMatch?.[1] ? htmlDecode(nameMatch[1]) : null;
+    const addressLines = Array.from(li.matchAll(/class="store_address">([\s\S]*?)<\/span>/g))
+      .map((match) => htmlDecode(match[1] ?? ""));
+    const detailsMatch = li.match(/class="bt_details_en"[^>]*onclick="([^"]+)"/);
+    const detailsOnclick = detailsMatch?.[1] ? htmlDecode(detailsMatch[1]) : null;
+    const distanceKm = addressLines.map(parseDistanceKm).find((value) => value !== null) ?? null;
+    const address = addressLines.find((line) => parseDistanceKm(line) === null) ?? null;
 
-    if (!name || !address || !mapOnclick || !detailsOnclick) {
+    if (!name || !address || !detailsOnclick || distanceKm === null) {
       continue;
     }
 
-    const coordinates = parseCoordinates(mapOnclick);
-    const cabinetId = parseCabinetId(detailsOnclick);
+    const cabinetId = detailsOnclick.match(/sid=(\d+)/)?.[1] ?? null;
 
-    if (!coordinates || !cabinetId) {
+    if (!cabinetId) {
       continue;
     }
 
-    const detailsUrl = `https://location.am-all.net/alm/shop?gm=98&astep=1009&sid=${cabinetId}&lang=en`;
+    const detailsUrl = `https://location.am-all.net/alm/shop?gm=98&astep=-1&sid=${cabinetId}&lang=en`;
 
     locations.push({
       id: cabinetId,
       name,
       address,
-      lat: coordinates.lat,
-      lon: coordinates.lon,
+      distanceKm,
       detailsUrl,
-      sourceUrl: SOURCE_URL,
-      distanceMiles: 0,
+      sourceUrl,
+      distanceMiles: distanceKm * 0.621371,
     });
   }
 
@@ -152,64 +111,66 @@ async function scrapeLocations(): Promise<CabinetLocation[]> {
   return locations;
 }
 
-function getTargetLocation(): TargetLocation {
-  const latRaw = process.env.TARGET_LAT;
-  const lonRaw = process.env.TARGET_LON;
-  const label = process.env.TARGET_LABEL?.trim() || DEFAULT_LOCATION.label;
-
-  if (!latRaw && !lonRaw) {
-    return DEFAULT_LOCATION;
+async function runCheckOnce(targetLocation: TargetLocation): Promise<void> {
+  const sourceUrl = `${LOCATION_BASE_URL}?${new URLSearchParams({
+    gm: LOCATION_GM,
+    lat: targetLocation.lat.toString(),
+    lng: targetLocation.lon.toString(),
+    lang: LOCATION_LANG,
+  }).toString()}`;
+  const locations = await scrapeLocations(sourceUrl);
+  const [closest] = locations;
+  if (!closest) {
+    throw new Error("No cabinet locations parsed from the source page");
   }
 
-  if (!latRaw || !lonRaw) {
-    throw new Error("Both TARGET_LAT and TARGET_LON must be set together.");
+  const stateFile = Bun.file(STATE_FILE);
+  const previous = await stateFile.exists() ? await stateFile.json() as ClosestState : null;
+  const checkedAt = new Date().toISOString();
+  const currentState: ClosestState = { checkedAt, closest };
+
+  await mkdir(dirname(STATE_FILE), { recursive: true });
+  await Bun.write(STATE_FILE, `${JSON.stringify(currentState, null, 2)}\n`);
+
+  console.log(`Parsed ${locations.length} cabinets from source.`);
+  console.log(
+    `Current closest to ${targetLocation.label}: ${closest.name} [sid=${closest.id}] - ${closest.address} (${closest.distanceMiles.toFixed(1)} mi)`,
+  );
+
+  if (!previous) {
+    console.log(`No previous state found at ${STATE_FILE}; initialized state without notifying.`);
+    return;
   }
 
-  const lat = Number.parseFloat(latRaw);
-  const lon = Number.parseFloat(lonRaw);
-
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-    throw new Error("TARGET_LAT and TARGET_LON must be valid numbers.");
+  if (previous.closest.id === closest.id) {
+    console.log("Closest cabinet unchanged. No webhook sent.");
+    return;
   }
 
-  return { lat, lon, label };
-}
-
-async function readState(path: string): Promise<ClosestState | null> {
-  const file = Bun.file(path);
-  if (!(await file.exists())) {
-    return null;
+  const webhookUrl = process.env.WEBHOOK_URL;
+  if (!webhookUrl) {
+    console.log("Closest cabinet changed, but WEBHOOK_URL is not set. Skipping webhook.");
+    return;
   }
 
-  const data = await file.json();
-  return data as ClosestState;
-}
-
-async function writeState(path: string, state: ClosestState): Promise<void> {
-  await mkdir(dirname(path), { recursive: true });
-  await Bun.write(path, `${JSON.stringify(state, null, 2)}\n`);
-}
-
-function buildDiscordWebhookBody(payload: ChangeEventPayload): Record<string, unknown> {
-  const prev = payload.previousClosest;
-  const next = payload.newClosest;
-
-  return {
+  const prev = previous.closest;
+  const next = closest;
+  const webhookBody = {
     username: "DX Finder",
-    content: `Closest maimai DX cabinet changed for **${payload.city}**.`,
+    content: `Closest maimai DX cabinet changed for **${targetLocation.label}**.`,
     embeds: [
       {
         title: "Closest Cabinet Updated",
-        url: payload.sourceUrl,
+        url: sourceUrl,
         color: 15277667,
-        timestamp: payload.checkedAt,
+        timestamp: checkedAt,
         fields: [
           {
             name: "Previous",
             value:
               `**${prev.name}** (sid: \`${prev.id}\`)\n` +
               `${prev.address}\n` +
-              `${prev.distanceMiles.toFixed(1)} mi from ${payload.city}\n` +
+              `${prev.distanceMiles.toFixed(1)} mi from ${targetLocation.label}\n` +
               `[Details](${prev.detailsUrl})`,
           },
           {
@@ -217,7 +178,7 @@ function buildDiscordWebhookBody(payload: ChangeEventPayload): Record<string, un
             value:
               `**${next.name}** (sid: \`${next.id}\`)\n` +
               `${next.address}\n` +
-              `${next.distanceMiles.toFixed(1)} mi from ${payload.city}\n` +
+              `${next.distanceMiles.toFixed(1)} mi from ${targetLocation.label}\n` +
               `[Details](${next.detailsUrl})`,
           },
         ],
@@ -230,79 +191,43 @@ function buildDiscordWebhookBody(payload: ChangeEventPayload): Record<string, un
       parse: [],
     },
   };
-}
 
-async function notifyWebhook(payload: ChangeEventPayload): Promise<void> {
-  const webhookUrl = process.env.WEBHOOK_URL;
-  if (!webhookUrl) {
-    console.log("Closest cabinet changed, but WEBHOOK_URL is not set. Skipping webhook.");
-    return;
-  }
-
-  const body = buildDiscordWebhookBody(payload);
   const response = await fetch(webhookUrl, {
     method: "POST",
     headers: {
       "content-type": "application/json",
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(webhookBody),
   });
 
   if (!response.ok) {
     const body = await response.text();
     throw new Error(`Webhook failed: HTTP ${response.status} ${body}`);
   }
-}
 
-function formatLocation(location: CabinetLocation): string {
-  return `${location.name} [sid=${location.id}] - ${location.address} (${location.distanceMiles.toFixed(1)} mi)`;
-}
-
-async function runCheckOnce(targetLocation: TargetLocation): Promise<void> {
-  const locations = await scrapeLocations();
-  const withDistance = locations.map((location) => ({
-    ...location,
-    distanceMiles: haversineMiles(targetLocation.lat, targetLocation.lon, location.lat, location.lon),
-  }));
-  const closest = withDistance.reduce((best, current) =>
-    current.distanceMiles < best.distanceMiles ? current : best,
-  );
-
-  const previous = await readState(STATE_FILE);
-  const checkedAt = new Date().toISOString();
-  const currentState: ClosestState = { checkedAt, closest };
-
-  await writeState(STATE_FILE, currentState);
-
-  console.log(`Parsed ${withDistance.length} cabinets from source.`);
-  console.log(`Current closest to ${targetLocation.label}: ${formatLocation(closest)}`);
-
-  if (!previous) {
-    console.log(`No previous state found at ${STATE_FILE}; initialized state without notifying.`);
-    return;
-  }
-
-  if (previous.closest.id === closest.id) {
-    console.log("Closest cabinet unchanged. No webhook sent.");
-    return;
-  }
-
-  const payload: ChangeEventPayload = {
-    event: "closest_cabinet_changed",
-    checkedAt,
-    city: targetLocation.label,
-    previousClosest: previous.closest,
-    newClosest: closest,
-    sourceUrl: SOURCE_URL,
-  };
-
-  await notifyWebhook(payload);
   console.log(
     `Closest cabinet changed: ${previous.closest.id} -> ${closest.id}. Webhook notification attempted.`,
   );
 }
 
-function setupSignalHandlers(): { shouldStop: () => boolean } {
+async function main(): Promise<void> {
+  const latRaw = process.env.TARGET_LAT;
+  const lonRaw = process.env.TARGET_LON;
+  const label = process.env.TARGET_LABEL?.trim() || DEFAULT_LOCATION.label;
+  let targetLocation: TargetLocation = DEFAULT_LOCATION;
+
+  if (latRaw || lonRaw) {
+    if (!latRaw || !lonRaw) {
+      throw new Error("Both TARGET_LAT and TARGET_LON must be set together.");
+    }
+    const lat = Number.parseFloat(latRaw);
+    const lon = Number.parseFloat(lonRaw);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      throw new Error("TARGET_LAT and TARGET_LON must be valid numbers.");
+    }
+    targetLocation = { lat, lon, label };
+  }
+
   let stopRequested = false;
   const handleStop = () => {
     stopRequested = true;
@@ -310,27 +235,11 @@ function setupSignalHandlers(): { shouldStop: () => boolean } {
   };
   process.on("SIGINT", handleStop);
   process.on("SIGTERM", handleStop);
-  return { shouldStop: () => stopRequested };
-}
 
-async function sleepUntilNextCycle(waitMs: number, shouldStop: () => boolean): Promise<void> {
-  const stepMs = 1000;
-  let remaining = waitMs;
-
-  while (remaining > 0 && !shouldStop()) {
-    const sleepMs = Math.min(stepMs, remaining);
-    await Bun.sleep(sleepMs);
-    remaining -= sleepMs;
-  }
-}
-
-async function main(): Promise<void> {
-  const targetLocation = getTargetLocation();
-  const { shouldStop } = setupSignalHandlers();
   console.log(`Starting monitor loop. Checking every ${CHECK_INTERVAL_MINUTES} minute(s).`);
   console.log(`Target location: ${targetLocation.label} (${targetLocation.lat}, ${targetLocation.lon})`);
 
-  while (!shouldStop()) {
+  while (!stopRequested) {
     const startedAt = Date.now();
     try {
       await runCheckOnce(targetLocation);
@@ -338,14 +247,18 @@ async function main(): Promise<void> {
       console.error("Check cycle failed:", error);
     }
 
-    if (shouldStop()) {
+    if (stopRequested) {
       break;
     }
 
     const elapsed = Date.now() - startedAt;
-    const waitMs = Math.max(0, CHECK_INTERVAL_MS - elapsed);
-    console.log(`Next check in ${(waitMs / 1000).toFixed(0)}s.`);
-    await sleepUntilNextCycle(waitMs, shouldStop);
+    let remaining = Math.max(0, CHECK_INTERVAL_MS - elapsed);
+    console.log(`Next check in ${(remaining / 1000).toFixed(0)}s.`);
+    while (remaining > 0 && !stopRequested) {
+      const sleepMs = Math.min(1000, remaining);
+      await Bun.sleep(sleepMs);
+      remaining -= sleepMs;
+    }
   }
 }
 
