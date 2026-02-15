@@ -1,6 +1,6 @@
 # dx-finder
 
-Bun + TypeScript monitor that scrapes the maimai DX location page and tracks the cabinet closest to Nashville, TN.
+Bun + TypeScript monitor that scrapes the maimai DX location page and tracks the cabinet closest to a target location (default: Nashville, TN).
 
 When the closest cabinet changes from the previously saved result, it sends a Discord webhook.
 
@@ -17,12 +17,18 @@ Environment variables:
 - `WEBHOOK_URL` (optional): Discord webhook URL to notify when closest cabinet changes.
 - `STATE_FILE` (optional): path to state JSON file. Defaults to `state/closest-cabinet.json`.
 - `CHECK_INTERVAL_MINUTES` (optional): how often to check. Defaults to `60`.
+- `TARGET_LAT` (optional): target latitude. Must be set with `TARGET_LON`.
+- `TARGET_LON` (optional): target longitude. Must be set with `TARGET_LAT`.
+- `TARGET_LABEL` (optional): display name in logs/Discord. Defaults to `Nashville, TN`.
 
 Example:
 
 ```bash
 export WEBHOOK_URL='https://example.com/webhook'
 export STATE_FILE='state/closest-cabinet.json'
+export TARGET_LAT='36.1627'
+export TARGET_LON='-86.7816'
+export TARGET_LABEL='Nashville, TN'
 ```
 
 ## Run

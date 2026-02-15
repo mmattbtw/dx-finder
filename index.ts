@@ -9,7 +9,7 @@ const CHECK_INTERVAL_MINUTES = Number.isFinite(RAW_INTERVAL_MINUTES) && RAW_INTE
   : 60;
 const CHECK_INTERVAL_MS = CHECK_INTERVAL_MINUTES * 60 * 1000;
 
-const NASHVILLE = {
+const DEFAULT_LOCATION = {
   lat: 36.1627,
   lon: -86.7816,
   label: "Nashville, TN",
@@ -38,6 +38,12 @@ type ChangeEventPayload = {
   previousClosest: CabinetLocation;
   newClosest: CabinetLocation;
   sourceUrl: string;
+};
+
+type TargetLocation = {
+  lat: number;
+  lon: number;
+  label: string;
 };
 
 function toRadians(value: number): number {
@@ -126,7 +132,6 @@ async function scrapeLocations(): Promise<CabinetLocation[]> {
     }
 
     const detailsUrl = `https://location.am-all.net/alm/shop?gm=98&astep=1009&sid=${cabinetId}&lang=en`;
-    const distanceMiles = haversineMiles(NASHVILLE.lat, NASHVILLE.lon, coordinates.lat, coordinates.lon);
 
     locations.push({
       id: cabinetId,
@@ -136,7 +141,7 @@ async function scrapeLocations(): Promise<CabinetLocation[]> {
       lon: coordinates.lon,
       detailsUrl,
       sourceUrl: SOURCE_URL,
-      distanceMiles,
+      distanceMiles: 0,
     });
   }
 
@@ -145,6 +150,29 @@ async function scrapeLocations(): Promise<CabinetLocation[]> {
   }
 
   return locations;
+}
+
+function getTargetLocation(): TargetLocation {
+  const latRaw = process.env.TARGET_LAT;
+  const lonRaw = process.env.TARGET_LON;
+  const label = process.env.TARGET_LABEL?.trim() || DEFAULT_LOCATION.label;
+
+  if (!latRaw && !lonRaw) {
+    return DEFAULT_LOCATION;
+  }
+
+  if (!latRaw || !lonRaw) {
+    throw new Error("Both TARGET_LAT and TARGET_LON must be set together.");
+  }
+
+  const lat = Number.parseFloat(latRaw);
+  const lon = Number.parseFloat(lonRaw);
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    throw new Error("TARGET_LAT and TARGET_LON must be valid numbers.");
+  }
+
+  return { lat, lon, label };
 }
 
 async function readState(path: string): Promise<ClosestState | null> {
@@ -230,9 +258,13 @@ function formatLocation(location: CabinetLocation): string {
   return `${location.name} [sid=${location.id}] - ${location.address} (${location.distanceMiles.toFixed(1)} mi)`;
 }
 
-async function runCheckOnce(): Promise<void> {
+async function runCheckOnce(targetLocation: TargetLocation): Promise<void> {
   const locations = await scrapeLocations();
-  const closest = locations.reduce((best, current) =>
+  const withDistance = locations.map((location) => ({
+    ...location,
+    distanceMiles: haversineMiles(targetLocation.lat, targetLocation.lon, location.lat, location.lon),
+  }));
+  const closest = withDistance.reduce((best, current) =>
     current.distanceMiles < best.distanceMiles ? current : best,
   );
 
@@ -242,8 +274,8 @@ async function runCheckOnce(): Promise<void> {
 
   await writeState(STATE_FILE, currentState);
 
-  console.log(`Parsed ${locations.length} cabinets from source.`);
-  console.log(`Current closest to ${NASHVILLE.label}: ${formatLocation(closest)}`);
+  console.log(`Parsed ${withDistance.length} cabinets from source.`);
+  console.log(`Current closest to ${targetLocation.label}: ${formatLocation(closest)}`);
 
   if (!previous) {
     console.log(`No previous state found at ${STATE_FILE}; initialized state without notifying.`);
@@ -258,7 +290,7 @@ async function runCheckOnce(): Promise<void> {
   const payload: ChangeEventPayload = {
     event: "closest_cabinet_changed",
     checkedAt,
-    city: NASHVILLE.label,
+    city: targetLocation.label,
     previousClosest: previous.closest,
     newClosest: closest,
     sourceUrl: SOURCE_URL,
@@ -293,13 +325,15 @@ async function sleepUntilNextCycle(waitMs: number, shouldStop: () => boolean): P
 }
 
 async function main(): Promise<void> {
+  const targetLocation = getTargetLocation();
   const { shouldStop } = setupSignalHandlers();
   console.log(`Starting monitor loop. Checking every ${CHECK_INTERVAL_MINUTES} minute(s).`);
+  console.log(`Target location: ${targetLocation.label} (${targetLocation.lat}, ${targetLocation.lon})`);
 
   while (!shouldStop()) {
     const startedAt = Date.now();
     try {
-      await runCheckOnce();
+      await runCheckOnce(targetLocation);
     } catch (error) {
       console.error("Check cycle failed:", error);
     }
